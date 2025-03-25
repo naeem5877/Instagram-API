@@ -1,9 +1,7 @@
 const express = require('express');
 const FormData = require('form-data');
+const fetch = require('node-fetch');
 const cors = require('cors');
-
-// Use global fetch if available (Node.js 18+), otherwise use node-fetch
-const fetch = global.fetch || require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
