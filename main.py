@@ -26,6 +26,55 @@ L = instaloader.Instaloader(
     max_connection_attempts=3
 )
 
+# Instagram authentication function
+def authenticate_instagram():
+    """Try multiple methods to authenticate with Instagram"""
+    # Method 1: Try to load from session file if available
+    try:
+        session_path = os.environ.get('INSTAGRAM_SESSION_FILE', '/tmp/instagram_session')
+        if os.path.exists(session_path):
+            username = os.environ.get('INSTAGRAM_USERNAME')
+            if username:
+                L.load_session_from_file(username, session_path)
+                logger.info(f"Loaded Instagram session for {username} from file")
+                return True
+    except Exception as e:
+        logger.warning(f"Could not load session from file: {e}")
+    
+    # Method 2: Try to create session from environment variables
+    try:
+        session_data = os.environ.get('INSTAGRAM_COOKIES')
+        username = os.environ.get('INSTAGRAM_USERNAME')
+        if session_data and username:
+            # Create a temporary session file
+            with open('/tmp/insta_session', 'w') as f:
+                f.write(session_data)
+            # Load the session
+            L.load_session_from_file(username, '/tmp/insta_session')
+            logger.info(f"Created Instagram session for {username} from environment")
+            return True
+    except Exception as e:
+        logger.warning(f"Could not create session from environment: {e}")
+    
+    # Method 3: Direct login with username/password
+    try:
+        username = os.environ.get('INSTAGRAM_USERNAME')
+        password = os.environ.get('INSTAGRAM_PASSWORD')
+        if username and password:
+            L.login(username, password)
+            # Save session for future use
+            L.save_session_to_file('/tmp/instagram_session')
+            logger.info(f"Logged in to Instagram as {username}")
+            return True
+    except Exception as e:
+        logger.error(f"Instagram login failed: {e}")
+    
+    logger.warning("No authentication method succeeded. API may have limited functionality.")
+    return False
+
+# Try to authenticate when the app starts
+authenticate_instagram()
+
 def extract_shortcode_from_url(url):
     """Extract the Instagram shortcode from a URL."""
     # Parse URL path
@@ -111,6 +160,11 @@ def get_post_data(url):
         return post_data, None
     
     except instaloader.exceptions.InstaloaderException as e:
+        # Check if it's an authentication error
+        if "401" in str(e) and not authenticate_instagram():
+            logger.error(f"Authentication error: {e}")
+            return None, "Authentication failed. Please check Instagram credentials."
+        
         logger.error(f"Instaloader error: {e}")
         return None, f"Instaloader error: {str(e)}"
     except Exception as e:
@@ -120,12 +174,20 @@ def get_post_data(url):
 def stream_media(url, content_type):
     """Stream media from URL without saving to disk."""
     try:
+        # Add Instagram cookies to the request if available
+        cookies = {}
+        try:
+            for cookie in L.context.session.cookies:
+                cookies[cookie.name] = cookie.value
+        except:
+            pass
+        
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         
         # Stream the content from the original URL
-        req = requests.get(url, headers=headers, stream=True)
+        req = requests.get(url, headers=headers, cookies=cookies, stream=True)
         req.raise_for_status()
         
         # Create a generator to stream the content
@@ -169,6 +231,13 @@ def get_data():
                 "message": "Instagram is rate limiting our requests. Please try again in a few minutes.",
                 "error": error
             }), 429
+        # Check if it's an authentication error
+        elif "Authentication failed" in error:
+            return jsonify({
+                "status": "auth_error",
+                "message": "Instagram authentication failed. Please check credentials.",
+                "error": error
+            }), 401
         return jsonify({"status": "error", "error": error}), 500
     
     # Return data
@@ -194,6 +263,22 @@ def stream_media_endpoint(shortcode):
             return stream_media(image_url, "image/jpeg")
     
     except instaloader.exceptions.InstaloaderException as e:
+        # Check if it's an authentication error
+        if "401" in str(e):
+            # Try to re-authenticate
+            if authenticate_instagram():
+                # Retry after authentication
+                try:
+                    post = instaloader.Post.from_shortcode(L.context, shortcode)
+                    if post.is_video:
+                        return stream_media(post.video_url, "video/mp4")
+                    else:
+                        return stream_media(post.url, "image/jpeg")
+                except Exception as retry_error:
+                    logger.error(f"Retry failed: {retry_error}")
+            
+            return jsonify({"error": "Authentication failed. Please check Instagram credentials."}), 401
+        
         logger.error(f"Instaloader error: {e}")
         return jsonify({"error": f"Instaloader error: {str(e)}"}), 500
     except Exception as e:
@@ -251,14 +336,53 @@ def get_direct_data():
         
         return jsonify(response_data)
         
+    except instaloader.exceptions.InstaloaderException as e:
+        # Check if it's an authentication error
+        if "401" in str(e) and authenticate_instagram():
+            # Try again after authentication
+            try:
+                return get_direct_data()
+            except Exception as retry_error:
+                logger.error(f"Retry after authentication failed: {retry_error}")
+                
+        logger.error(f"Instaloader error in direct-data: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
     except Exception as e:
         logger.error(f"Error in direct-data endpoint: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
+# Add session status endpoint
+@app.route('/api/auth-status', methods=['GET'])
+def auth_status():
+    """Check if Instagram authentication is working"""
+    try:
+        # Basic test: try to get profile of a public user
+        test_user = "instagram"
+        profile = instaloader.Profile.from_username(L.context, test_user)
+        
+        return jsonify({
+            "status": "authenticated",
+            "username": L.context.username if hasattr(L.context, 'username') else None,
+            "test_profile": {
+                "username": profile.username,
+                "followers": profile.followers,
+                "is_verified": profile.is_verified
+            }
+        })
+    except Exception as e:
+        # Try to authenticate
+        auth_success = authenticate_instagram()
+        
+        return jsonify({
+            "status": "error" if not auth_success else "re-authenticated",
+            "error": str(e),
+            "authenticated": auth_success
+        })
+
 # Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "ok", "version": "1.1.0"})
+    return jsonify({"status": "ok", "version": "1.2.0"})
 
 # Simple web interface
 @app.route('/', methods=['GET'])
@@ -281,10 +405,14 @@ def index():
             .profile-container { display: flex; align-items: center; margin-top: 15px; }
             .profile-pic { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; }
             .profile-info { flex: 1; }
+            .status-bar { padding: 10px; margin-bottom: 15px; background: #f0f0f0; border-radius: 4px; }
+            .status-ok { background: #e0f7e0; }
+            .status-error { background: #f7e0e0; }
         </style>
     </head>
     <body>
         <h1>Instagram Data API</h1>
+        <div id="auth-status" class="status-bar">Checking authentication status...</div>
         <div class="form-group">
             <label for="insta-url">Enter Instagram URL:</label>
             <input type="text" id="insta-url" placeholder="https://www.instagram.com/p/SHORTCODE/">
@@ -292,10 +420,36 @@ def index():
         <div class="button-group">
             <button onclick="fetchData()">Get Full Data</button>
             <button onclick="fetchDirectData()">Get Direct Media URL</button>
+            <button onclick="checkAuth()">Check Auth Status</button>
         </div>
         <div id="result" class="result" style="display:none;"></div>
         
         <script>
+            // Check auth status on page load
+            window.onload = checkAuth;
+            
+            function checkAuth() {
+                const statusDiv = document.getElementById('auth-status');
+                statusDiv.textContent = 'Checking authentication status...';
+                statusDiv.className = 'status-bar';
+                
+                fetch('/api/auth-status')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'authenticated') {
+                            statusDiv.textContent = `Authentication: OK (${data.username || 'Anonymous'})`;
+                            statusDiv.className = 'status-bar status-ok';
+                        } else {
+                            statusDiv.textContent = `Authentication: Failed (${data.error})`;
+                            statusDiv.className = 'status-bar status-error';
+                        }
+                    })
+                    .catch(error => {
+                        statusDiv.textContent = `Authentication status error: ${error.message}`;
+                        statusDiv.className = 'status-bar status-error';
+                    });
+            }
+            
             function fetchData() {
                 const url = document.getElementById('insta-url').value;
                 if (!url) {
@@ -378,7 +532,13 @@ def index():
     </html>
     '''
 
-# For Koyeb deployment
+# For deployment - use gunicorn in production
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Only use the development server in local environments
+    if os.environ.get('ENVIRONMENT') == 'development':
+        app.run(host='0.0.0.0', port=port)
+    else:
+        # This message is just a reminder - in production, use gunicorn or another WSGI server
+        print("WARNING: For production use, run with gunicorn or another WSGI server.")
+        app.run(host='0.0.0.0', port=port)
