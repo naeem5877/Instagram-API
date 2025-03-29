@@ -8,7 +8,6 @@ import logging
 import hashlib
 from datetime import datetime, timedelta
 import io
-import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -27,70 +26,31 @@ L = instaloader.Instaloader(
     max_connection_attempts=3
 )
 
-# Load Instagram session using cookies from environment variable or file
-def load_session_with_cookies():
-    try:
-        # Option 1: Load cookies from environment variable
-        cookies_json = os.environ.get('INSTAGRAM_COOKIES')
-        if cookies_json:
-            # Parse the JSON string (could be array or dict)
-            cookies_data = json.loads(cookies_json)
-            
-            # Convert array of cookie objects to a dictionary if needed
-            if isinstance(cookies_data, list):
-                cookies = {cookie["name"]: cookie["value"] for cookie in cookies_data}
-            else:
-                cookies = cookies_data  # Already a dict
-            
-            L.context._session.cookies.update(cookies)
-            logger.info("Loaded Instagram session from cookies in environment variable")
-            return True
-        
-        # Option 2: Load cookies from a file (if present)
-        cookies_file = "instagram_cookies.json"
-        if os.path.exists(cookies_file):
-            with open(cookies_file, 'r') as f:
-                cookies_data = json.load(f)
-                
-                # Convert array of cookie objects to a dictionary if needed
-                if isinstance(cookies_data, list):
-                    cookies = {cookie["name"]: cookie["value"] for cookie in cookies_data}
-                else:
-                    cookies = cookies_data  # Already a dict
-                
-                L.context._session.cookies.update(cookies)
-            logger.info("Loaded Instagram session from cookies file")
-            return True
-        
-        logger.warning("No Instagram cookies provided; running anonymously")
-        return False
-    
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse cookies JSON: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to load cookies: {e}")
-        return False
-
-# Initialize session
-load_session_with_cookies()
-
 def extract_shortcode_from_url(url):
     """Extract the Instagram shortcode from a URL."""
+    # Parse URL path
     path = urlparse(url).path
+    
+    # Strip trailing slash if present
     if path.endswith('/'):
         path = path[:-1]
+    
+    # Get the last part of the path which should be the shortcode
     shortcode = path.split('/')[-1]
+    
     return shortcode
 
 def get_post_data(url):
     """Get comprehensive data about an Instagram post."""
     try:
+        # Extract shortcode from URL
         shortcode = extract_shortcode_from_url(url)
         logger.info(f"Extracted shortcode: {shortcode}")
         
+        # Get post by shortcode
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         
+        # Base post data
         post_data = {
             "id": post.mediaid,
             "shortcode": post.shortcode,
@@ -113,9 +73,12 @@ def get_post_data(url):
             }
         }
         
+        # Add URLs
         if post.is_video:
             post_data["urls"]["video"] = post.video_url
             post_data["urls"]["thumbnail"] = post.url
+            
+            # Generate direct URL (no download token needed now that we're streaming)
             base_url = request.host_url.rstrip('/')
             post_data["urls"]["download"] = f"{base_url}/api/media/stream/{post.shortcode}"
         else:
@@ -124,6 +87,7 @@ def get_post_data(url):
         
         post_data["urls"]["instagram"] = f"https://www.instagram.com/p/{post.shortcode}/"
         
+        # Try to add additional owner information, but don't fail if it's not available
         try:
             owner_profile = post.owner_profile
             post_data["owner"].update({
@@ -136,6 +100,8 @@ def get_post_data(url):
             })
         except Exception as profile_error:
             logger.warning(f"Could not fetch complete profile data: {profile_error}")
+            
+            # Try to get at least the profile picture directly
             try:
                 profile = instaloader.Profile.from_username(L.context, post.owner_username)
                 post_data["owner"]["profile_pic_url"] = profile.profile_pic_url
@@ -144,10 +110,6 @@ def get_post_data(url):
         
         return post_data, None
     
-    except instaloader.exceptions.LoginRequiredException:
-        return None, "Session expired or invalid cookies; login required"
-    except instaloader.exceptions.ConnectionException as e:
-        return None, f"Connection error, possibly rate limited: {str(e)}"
     except instaloader.exceptions.InstaloaderException as e:
         logger.error(f"Instaloader error: {e}")
         return None, f"Instaloader error: {str(e)}"
@@ -161,17 +123,23 @@ def stream_media(url, content_type):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
+        
+        # Stream the content from the original URL
         req = requests.get(url, headers=headers, stream=True)
         req.raise_for_status()
         
+        # Create a generator to stream the content
         def generate():
             for chunk in req.iter_content(chunk_size=8192):
                 yield chunk
                 
+        # Return a streaming response
         return Response(
             generate(),
             content_type=content_type,
-            headers={'Content-Disposition': 'attachment'}
+            headers={
+                'Content-Disposition': 'attachment'
+            }
         )
     except Exception as e:
         logger.error(f"Streaming error: {e}")
@@ -180,17 +148,21 @@ def stream_media(url, content_type):
 @app.route('/api/data', methods=['GET'])
 def get_data():
     """API endpoint to get comprehensive data about an Instagram post."""
+    # Get URL from query parameter
     url = request.args.get('url')
     
     if not url:
         return jsonify({"error": "URL parameter is required"}), 400
     
+    # Validate Instagram URL
     if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
         return jsonify({"error": "Invalid Instagram URL"}), 400
     
+    # Get post data
     post_data, error = get_post_data(url)
     
     if error:
+        # Check if it's a rate limit error
         if "Please wait a few minutes before you try again" in error:
             return jsonify({
                 "status": "limited",
@@ -199,6 +171,7 @@ def get_data():
             }), 429
         return jsonify({"status": "error", "error": error}), 500
     
+    # Return data
     return jsonify({
         "status": "success",
         "data": post_data
@@ -208,11 +181,14 @@ def get_data():
 def stream_media_endpoint(shortcode):
     """API endpoint to stream Instagram media directly without saving to disk."""
     try:
+        # Get post by shortcode
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         
+        # For videos
         if post.is_video:
             video_url = post.video_url
             return stream_media(video_url, "video/mp4")
+        # For images
         else:
             image_url = post.url
             return stream_media(image_url, "image/jpeg")
@@ -227,20 +203,25 @@ def stream_media_endpoint(shortcode):
 @app.route('/api/direct-data', methods=['GET'])
 def get_direct_data():
     """API endpoint to get direct video URL without profile info (less prone to rate limiting)."""
+    # Get URL from query parameter
     url = request.args.get('url')
     
     if not url:
         return jsonify({"error": "URL parameter is required"}), 400
     
+    # Validate Instagram URL
     if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
         return jsonify({"error": "Invalid Instagram URL"}), 400
     
     try:
+        # Extract shortcode from URL
         shortcode = extract_shortcode_from_url(url)
         logger.info(f"Extracted shortcode: {shortcode}")
         
+        # Get post by shortcode
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         
+        # Create direct response with just the critical data
         response_data = {
             "status": "success",
             "data": {
@@ -250,15 +231,18 @@ def get_direct_data():
             }
         }
         
+        # Add URLs
         if post.is_video:
             response_data["data"]["urls"]["video"] = post.video_url
             response_data["data"]["urls"]["thumbnail"] = post.url
         else:
             response_data["data"]["urls"]["image"] = post.url
         
+        # Add streaming endpoint URL
         base_url = request.host_url.rstrip('/')
         response_data["data"]["urls"]["download"] = f"{base_url}/api/media/stream/{post.shortcode}"
         
+        # Try to get profile picture
         try:
             profile = instaloader.Profile.from_username(L.context, post.owner_username)
             response_data["data"]["profile_pic"] = profile.profile_pic_url
@@ -267,18 +251,16 @@ def get_direct_data():
         
         return jsonify(response_data)
         
-    except instaloader.exceptions.LoginRequiredException:
-        return jsonify({"status": "error", "error": "Session expired or invalid cookies; login required"}), 401
-    except instaloader.exceptions.ConnectionException as e:
-        return jsonify({"status": "error", "error": f"Connection error, possibly rate limited: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Error in direct-data endpoint: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
+# Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({"status": "ok", "version": "1.1.0"})
 
+# Simple web interface
 @app.route('/', methods=['GET'])
 def index():
     return '''
@@ -396,6 +378,7 @@ def index():
     </html>
     '''
 
+# For Koyeb deployment
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
