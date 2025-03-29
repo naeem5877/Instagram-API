@@ -33,7 +33,15 @@ def load_session_with_cookies():
         # Option 1: Load cookies from environment variable
         cookies_json = os.environ.get('INSTAGRAM_COOKIES')
         if cookies_json:
-            cookies = json.loads(cookies_json)
+            # Parse the JSON string (could be array or dict)
+            cookies_data = json.loads(cookies_json)
+            
+            # Convert array of cookie objects to a dictionary if needed
+            if isinstance(cookies_data, list):
+                cookies = {cookie["name"]: cookie["value"] for cookie in cookies_data}
+            else:
+                cookies = cookies_data  # Already a dict
+            
             L.context._session.cookies.update(cookies)
             logger.info("Loaded Instagram session from cookies in environment variable")
             return True
@@ -42,7 +50,14 @@ def load_session_with_cookies():
         cookies_file = "instagram_cookies.json"
         if os.path.exists(cookies_file):
             with open(cookies_file, 'r') as f:
-                cookies = json.load(f)
+                cookies_data = json.load(f)
+                
+                # Convert array of cookie objects to a dictionary if needed
+                if isinstance(cookies_data, list):
+                    cookies = {cookie["name"]: cookie["value"] for cookie in cookies_data}
+                else:
+                    cookies = cookies_data  # Already a dict
+                
                 L.context._session.cookies.update(cookies)
             logger.info("Loaded Instagram session from cookies file")
             return True
@@ -50,6 +65,9 @@ def load_session_with_cookies():
         logger.warning("No Instagram cookies provided; running anonymously")
         return False
     
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse cookies JSON: {e}")
+        return False
     except Exception as e:
         logger.error(f"Failed to load cookies: {e}")
         return False
