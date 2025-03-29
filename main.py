@@ -8,6 +8,7 @@ import logging
 import hashlib
 from datetime import datetime, timedelta
 import io
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -26,21 +27,35 @@ L = instaloader.Instaloader(
     max_connection_attempts=3
 )
 
-# Login with Instagram credentials from environment variables
-try:
-    username = os.environ.get('INSTAGRAM_USERNAME')
-    password = os.environ.get('INSTAGRAM_PASSWORD')
-    if username and password:
-        L.login(username, password)
-        logger.info("Successfully logged into Instagram")
-    else:
-        logger.warning("No Instagram credentials provided; running anonymously")
-except instaloader.exceptions.BadCredentialsException:
-    logger.error("Invalid Instagram credentials")
-except instaloader.exceptions.ConnectionException as e:
-    logger.error(f"Login failed: {e}")
-except Exception as e:
-    logger.error(f"Unexpected error during login: {e}")
+# Load Instagram session using cookies from environment variable or file
+def load_session_with_cookies():
+    try:
+        # Option 1: Load cookies from environment variable
+        cookies_json = os.environ.get('INSTAGRAM_COOKIES')
+        if cookies_json:
+            cookies = json.loads(cookies_json)
+            L.context._session.cookies.update(cookies)
+            logger.info("Loaded Instagram session from cookies in environment variable")
+            return True
+        
+        # Option 2: Load cookies from a file (if present)
+        cookies_file = "instagram_cookies.json"
+        if os.path.exists(cookies_file):
+            with open(cookies_file, 'r') as f:
+                cookies = json.load(f)
+                L.context._session.cookies.update(cookies)
+            logger.info("Loaded Instagram session from cookies file")
+            return True
+        
+        logger.warning("No Instagram cookies provided; running anonymously")
+        return False
+    
+    except Exception as e:
+        logger.error(f"Failed to load cookies: {e}")
+        return False
+
+# Initialize session
+load_session_with_cookies()
 
 def extract_shortcode_from_url(url):
     """Extract the Instagram shortcode from a URL."""
@@ -112,7 +127,7 @@ def get_post_data(url):
         return post_data, None
     
     except instaloader.exceptions.LoginRequiredException:
-        return None, "Login required to access this content"
+        return None, "Session expired or invalid cookies; login required"
     except instaloader.exceptions.ConnectionException as e:
         return None, f"Connection error, possibly rate limited: {str(e)}"
     except instaloader.exceptions.InstaloaderException as e:
@@ -235,7 +250,7 @@ def get_direct_data():
         return jsonify(response_data)
         
     except instaloader.exceptions.LoginRequiredException:
-        return jsonify({"status": "error", "error": "Login required to access this content"}), 401
+        return jsonify({"status": "error", "error": "Session expired or invalid cookies; login required"}), 401
     except instaloader.exceptions.ConnectionException as e:
         return jsonify({"status": "error", "error": f"Connection error, possibly rate limited: {str(e)}"}), 500
     except Exception as e:
