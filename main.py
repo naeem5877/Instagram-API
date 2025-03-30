@@ -9,7 +9,6 @@ import hashlib
 from datetime import datetime, timedelta
 import io
 import time
-import json
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Set up logging
@@ -31,47 +30,19 @@ L = instaloader.Instaloader(
     max_connection_attempts=3
 )
 
-# Function to load cookies from file for authentication
-def load_session_from_file(filename):
-    try:
-        with open(filename, 'r') as f:
-            cookies = json.load(f)
-            
-        cookie_dict = {}
-        for cookie in cookies:
-            if cookie.get('domain', '').endswith('instagram.com'):
-                cookie_dict[cookie.get('name')] = cookie.get('value')
-        
-        # Create a session with the cookies
-        session = requests.Session()
-        session.cookies.update(cookie_dict)
-        
-        # Import session into Instaloader
-        L.context._session = session
-        
-        # Try to verify login status
-        try:
-            test_profile = instaloader.Profile.from_username(L.context, "instagram")
-            logger.info(f"Successfully logged in with cookies")
-            return True
-        except Exception as e:
-            logger.error(f"Cookie validation failed: {e}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Failed to load cookies: {e}")
-        return False
-
-# Try to authenticate with cookies if available
-cookie_login_success = False
-if os.path.exists('cookie.json'):
-    cookie_login_success = load_session_from_file('cookie.json')
-    if cookie_login_success:
-        logger.info("Successfully authenticated with Instagram using cookies")
+# Load session from cookie file
+try:
+    cookie_file = os.environ.get('INSTAGRAM_COOKIE_FILE', 'cookie.txt')
+    instagram_username = os.environ.get('INSTAGRAM_USERNAME', 'na.ru.to_uzumaki_')
+    
+    if os.path.exists(cookie_file) and instagram_username:
+        L.load_session_from_file(instagram_username, cookie_file)
+        logger.info(f"Successfully loaded session for user {instagram_username} from cookie file")
     else:
-        logger.warning("Cookie authentication failed, continuing in login-less mode")
-else:
-    logger.warning("No cookie.json file found, running in login-less mode")
+        logger.warning("Cookie file not found or username not provided. Running in login-less mode.")
+except Exception as e:
+    logger.warning(f"Could not load Instagram session from cookies: {e}")
+    logger.warning("Running in login-less mode. Some features may be limited.")
 
 # Retry decorator for handling rate limits
 def retry_with_backoff(max_retries=3, initial_backoff=2):
@@ -295,31 +266,31 @@ def stream_media(url, content_type):
         logger.error(f"Streaming error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# Add missing endpoint for streaming media
 @app.route('/api/media/stream/<shortcode>', methods=['GET'])
-def stream_media_by_shortcode(shortcode):
-    """Stream media directly by shortcode."""
+def stream_media_endpoint(shortcode):
+    """Endpoint to stream media directly from Instagram."""
     try:
-        # Get post data first
-        url = f"https://www.instagram.com/p/{shortcode}/"
-        post_data, error = get_post_data(url)
+        # Get the post by shortcode
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
         
-        if error:
-            return jsonify({"error": error}), 500
-        
-        # Determine content type and URL
-        if post_data["is_video"]:
-            content_type = "video/mp4"
-            media_url = post_data["urls"]["video"]
+        # Determine URL and content type based on post type
+        if post.is_video:
+            url = post.video_url
+            content_type = 'video/mp4'
         else:
-            content_type = "image/jpeg"
-            media_url = post_data["urls"]["image"]
+            url = post.url
+            content_type = 'image/jpeg'
         
         # Stream the media
-        return stream_media(media_url, content_type)
+        return stream_media(url, content_type)
     
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error streaming media: {e}")
+        return jsonify({
+            "status": "error",
+            "error": f"Could not stream media: {str(e)}"
+        }), 500
 
 @app.route('/api/data', methods=['GET'])
 def get_data():
@@ -343,11 +314,10 @@ def get_data():
         post_data, new_error = get_post_data_no_login(url)
         if new_error:
             return jsonify({
-                "status": "error", 
-                "error": new_error,
-                "message": "Instagram authentication failed. Please check credentials.",
-                "status_code": "auth_error"
-            }), 500
+                "status": "auth_error",
+                "error": "Authentication failed. Please check Instagram credentials.",
+                "message": "Instagram authentication failed. Please check credentials."
+            }), 401
     elif error:
         # Check if it's a rate limit error
         if "Please wait a few minutes before you try again" in error or "429" in error:
@@ -357,12 +327,7 @@ def get_data():
                 "error": error
             }), 429
         else:
-            return jsonify({
-                "status": "error", 
-                "error": error,
-                "message": "Error fetching Instagram data.",
-                "status_code": "general_error"
-            }), 500
+            return jsonify({"status": "error", "error": error}), 500
     
     # Return data
     return jsonify({
@@ -420,16 +385,29 @@ def get_embed(shortcode):
 # Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
+    # Check if we have a valid Instagram session
+    is_logged_in = L.context.is_logged_in
+    
     return jsonify({
         "status": "ok", 
         "version": "1.2.0",
-        "loginless_mode": not cookie_login_success
+        "instagram_login_status": "logged_in" if is_logged_in else "not_logged_in",
+        "loginless_mode": not is_logged_in
     })
 
 # Simple web interface
 @app.route('/', methods=['GET'])
 def index():
-    login_status = "Authenticated with cookies" if cookie_login_success else "Running in login-less mode"
+    # Check if we have a valid Instagram session
+    is_logged_in = L.context.is_logged_in
+    status_message = ""
+    
+    if is_logged_in:
+        status_message = "Running with Instagram authentication. Full features available."
+        status_class = "success"
+    else:
+        status_message = "Running in login-less mode. Some features may be limited. For videos, use the embed approach."
+        status_class = "info"
     
     return f'''
     <!DOCTYPE html>
@@ -451,6 +429,7 @@ def index():
             .profile-info {{ flex: 1; }}
             .status {{ padding: 10px; margin-bottom: 15px; border-radius: 5px; }}
             .status.info {{ background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }}
+            .status.success {{ background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }}
             .tabs {{ display: flex; margin-bottom: 20px; }}
             .tab {{ padding: 10px 15px; background: #f0f0f0; cursor: pointer; border: 1px solid #ccc; }}
             .tab.active {{ background: #3897f0; color: white; border-color: #3897f0; }}
@@ -461,8 +440,8 @@ def index():
     <body>
         <h1>Instagram Data API</h1>
         
-        <div id="status-message" class="status info">
-            Status: {login_status}. {'' if cookie_login_success else 'Some features may be limited. For videos, use the embed approach.'}
+        <div id="status-message" class="status {status_class}">
+            {status_message}
         </div>
         
         <div class="form-group">
