@@ -396,10 +396,11 @@ def stream_media_by_shortcode(shortcode):
         
         # Use yt-dlp to get the direct URL
         ydl_opts = {
-            'quiet': False,  # Changed to see more logs
+            'quiet': False,
             'no_warnings': False,
-            'format': 'bestvideo+bestaudio/best',
-            'simulate': True,  # Don't download, just extract info
+            'format': 'bestvideo+bestaudio/best',  # This will select the best quality with audio
+            'merge_output_format': 'mp4',
+            'simulate': True,
             'cookiefile': cookie_path if has_cookies else None,
             'verbose': True
         }
@@ -424,32 +425,78 @@ def stream_media_by_shortcode(shortcode):
             
             if is_video:
                 content_type = "video/mp4"
-                if 'formats' in media_info and media_info['formats']:
-                    # Get the best quality video
-                    best_video = None
-                    best_quality = -1
+                # Check if there's a direct URL that already has audio and video
+                if media_info.get('url') and (
+                    media_info.get('acodec') != 'none' and 
+                    media_info.get('vcodec') != 'none'
+                ):
+                    media_url = media_info.get('url')
+                    logger.info("Using direct URL with audio and video for streaming")
+                elif 'formats' in media_info and media_info['formats']:
+                    # First try to find a format that already has both audio and video
+                    best_combined_format = None
+                    best_height = -1
                     
-                    logger.info(f"Found {len(media_info['formats'])} video formats")
+                    logger.info(f"Found {len(media_info['formats'])} formats")
                     
+                    # Look for formats with both audio and video
                     for fmt in media_info['formats']:
-                        if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
-                            best_quality = fmt.get('height', 0)
-                            best_video = fmt
+                        if (fmt.get('ext') == 'mp4' and 
+                            fmt.get('acodec') != 'none' and 
+                            fmt.get('vcodec') != 'none' and 
+                            fmt.get('height', 0) > best_height):
+                            best_height = fmt.get('height', 0)
+                            best_combined_format = fmt
                     
-                    if best_video:
-                        media_url = best_video.get('url')
-                        logger.info(f"Selected best video quality: {best_quality}p")
+                    # If we found a combined format, use it
+                    if best_combined_format:
+                        media_url = best_combined_format.get('url')
+                        logger.info(f"Selected combined format with audio+video at {best_height}p")
                     else:
-                        logger.warning("No MP4 format found in formats list for streaming")
-                        media_url = media_info.get('url')
+                        # If no combined format, check if there's a format_id that yt-dlp has determined
+                        # is the best combination of audio and video
+                        if 'requested_formats' in media_info:
+                            # This is yt-dlp's merged selection
+                            logger.info("Using yt-dlp's requested_formats for best quality")
+                            # Use the URL from the video format since that's what we want to stream
+                            for fmt in media_info['requested_formats']:
+                                if fmt.get('vcodec') != 'none':  # This is the video part
+                                    media_url = fmt.get('url')
+                                    logger.info(f"Using video URL from requested format: {fmt.get('format_id')}")
+                                    break
+                            else:
+                                # Fallback to the default URL if we can't find the video part
+                                media_url = media_info.get('url')
+                                logger.info("Fallback to default URL")
+                        else:
+                            # Fallback to the highest quality video-only format
+                            # Note: This might result in video without audio
+                            best_video = None
+                            best_quality = -1
+                            
+                            for fmt in media_info['formats']:
+                                if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
+                                    best_quality = fmt.get('height', 0)
+                                    best_video = fmt
+                            
+                            if best_video:
+                                media_url = best_video.get('url')
+                                logger.warning(f"Could not find format with audio. Using best video only: {best_quality}p")
+                            else:
+                                logger.warning("No MP4 format found. Using default URL which might not have audio")
+                                media_url = media_info.get('url')
                 else:
                     media_url = media_info.get('url')
-                    logger.info("Using direct URL for video streaming")
+                    logger.info("Using direct URL for video streaming (may not have audio)")
             else:
                 content_type = "image/jpeg"
                 media_url = media_info.get('url')
                 logger.info("Using direct URL for image streaming")
             
+            if not media_url:
+                logger.error("No media URL found")
+                return jsonify({"error": "No media URL found"}), 500
+                
             logger.info(f"Final media URL for streaming (first 50 chars): {media_url[:50]}...")
             
             # Stream the media
@@ -605,11 +652,12 @@ def download_media():
         has_cookies = os.path.exists(cookie_path)
         logger.info(f"Download endpoint using cookie file: {cookie_path if has_cookies else 'No cookie file'}")
         
-        # Use yt-dlp to get the direct URL
+        # Use yt-dlp to get the direct URL with audio and video
         ydl_opts = {
             'quiet': False,
             'no_warnings': False,
-            'format': 'best',  # Choose best quality
+            'format': 'bestvideo+bestaudio/best',  # This will prefer merged streams with audio
+            'merge_output_format': 'mp4',  # Ensure we get MP4 format
             'simulate': True,  # Don't download, just extract info
             'cookiefile': cookie_path if has_cookies else None,
             'verbose': True
@@ -635,32 +683,78 @@ def download_media():
             
             if is_video:
                 content_type = "video/mp4"
-                if 'formats' in media_info and media_info['formats']:
-                    # Get the best quality video
-                    best_video = None
-                    best_quality = -1
+                # Check if there's a direct URL that already has audio and video
+                if media_info.get('url') and (
+                    media_info.get('acodec') != 'none' and 
+                    media_info.get('vcodec') != 'none'
+                ):
+                    media_url = media_info.get('url')
+                    logger.info("Using direct URL with audio and video")
+                elif 'formats' in media_info and media_info['formats']:
+                    # First try to find a format that already has both audio and video
+                    best_combined_format = None
+                    best_height = -1
                     
-                    logger.info(f"Found {len(media_info['formats'])} video formats")
+                    logger.info(f"Found {len(media_info['formats'])} formats")
                     
+                    # Look for formats with both audio and video
                     for fmt in media_info['formats']:
-                        if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
-                            best_quality = fmt.get('height', 0)
-                            best_video = fmt
+                        if (fmt.get('ext') == 'mp4' and 
+                            fmt.get('acodec') != 'none' and 
+                            fmt.get('vcodec') != 'none' and 
+                            fmt.get('height', 0) > best_height):
+                            best_height = fmt.get('height', 0)
+                            best_combined_format = fmt
                     
-                    if best_video:
-                        media_url = best_video.get('url')
-                        logger.info(f"Selected best video quality: {best_quality}p")
+                    # If we found a combined format, use it
+                    if best_combined_format:
+                        media_url = best_combined_format.get('url')
+                        logger.info(f"Selected combined format with audio+video at {best_height}p")
                     else:
-                        logger.warning("No MP4 format found in formats list for download")
-                        media_url = media_info.get('url')
+                        # If no combined format, check if there's a format_id that yt-dlp has determined
+                        # is the best combination of audio and video
+                        if 'requested_formats' in media_info:
+                            # This is yt-dlp's merged selection
+                            logger.info("Using yt-dlp's requested_formats for best quality")
+                            # Use the URL from the video format since that's what we want to stream
+                            for fmt in media_info['requested_formats']:
+                                if fmt.get('vcodec') != 'none':  # This is the video part
+                                    media_url = fmt.get('url')
+                                    logger.info(f"Using video URL from requested format: {fmt.get('format_id')}")
+                                    break
+                            else:
+                                # Fallback to the default URL if we can't find the video part
+                                media_url = media_info.get('url')
+                                logger.info("Fallback to default URL")
+                        else:
+                            # Fallback to the highest quality video-only format
+                            # Note: This might result in video without audio
+                            best_video = None
+                            best_quality = -1
+                            
+                            for fmt in media_info['formats']:
+                                if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
+                                    best_quality = fmt.get('height', 0)
+                                    best_video = fmt
+                            
+                            if best_video:
+                                media_url = best_video.get('url')
+                                logger.warning(f"Could not find format with audio. Using best video only: {best_quality}p")
+                            else:
+                                logger.warning("No MP4 format found. Using default URL which might not have audio")
+                                media_url = media_info.get('url')
                 else:
                     media_url = media_info.get('url')
-                    logger.info("Using direct URL for video download")
+                    logger.info("Using direct URL for video download (may not have audio)")
             else:
                 content_type = "image/jpeg"
                 media_url = media_info.get('url')
                 logger.info("Using direct URL for image download")
             
+            if not media_url:
+                logger.error("No media URL found")
+                return jsonify({"error": "No media URL found"}), 500
+                
             logger.info(f"Final media URL for download (first 50 chars): {media_url[:50]}...")
             
             # Stream the media
