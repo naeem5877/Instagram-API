@@ -9,6 +9,7 @@ import hashlib
 from datetime import datetime, timedelta
 import io
 import time
+import json
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Set up logging
@@ -29,6 +30,48 @@ L = instaloader.Instaloader(
     post_metadata_txt_pattern="",
     max_connection_attempts=3
 )
+
+# Function to load cookies from file for authentication
+def load_session_from_file(filename):
+    try:
+        with open(filename, 'r') as f:
+            cookies = json.load(f)
+            
+        cookie_dict = {}
+        for cookie in cookies:
+            if cookie.get('domain', '').endswith('instagram.com'):
+                cookie_dict[cookie.get('name')] = cookie.get('value')
+        
+        # Create a session with the cookies
+        session = requests.Session()
+        session.cookies.update(cookie_dict)
+        
+        # Import session into Instaloader
+        L.context._session = session
+        
+        # Try to verify login status
+        try:
+            test_profile = instaloader.Profile.from_username(L.context, "instagram")
+            logger.info(f"Successfully logged in with cookies")
+            return True
+        except Exception as e:
+            logger.error(f"Cookie validation failed: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Failed to load cookies: {e}")
+        return False
+
+# Try to authenticate with cookies if available
+cookie_login_success = False
+if os.path.exists('cookie.json'):
+    cookie_login_success = load_session_from_file('cookie.json')
+    if cookie_login_success:
+        logger.info("Successfully authenticated with Instagram using cookies")
+    else:
+        logger.warning("Cookie authentication failed, continuing in login-less mode")
+else:
+    logger.warning("No cookie.json file found, running in login-less mode")
 
 # Retry decorator for handling rate limits
 def retry_with_backoff(max_retries=3, initial_backoff=2):
@@ -252,6 +295,32 @@ def stream_media(url, content_type):
         logger.error(f"Streaming error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/media/stream/<shortcode>', methods=['GET'])
+def stream_media_by_shortcode(shortcode):
+    """Stream media directly by shortcode."""
+    try:
+        # Get post data first
+        url = f"https://www.instagram.com/p/{shortcode}/"
+        post_data, error = get_post_data(url)
+        
+        if error:
+            return jsonify({"error": error}), 500
+        
+        # Determine content type and URL
+        if post_data["is_video"]:
+            content_type = "video/mp4"
+            media_url = post_data["urls"]["video"]
+        else:
+            content_type = "image/jpeg"
+            media_url = post_data["urls"]["image"]
+        
+        # Stream the media
+        return stream_media(media_url, content_type)
+    
+    except Exception as e:
+        logger.error(f"Streaming error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/data', methods=['GET'])
 def get_data():
     """API endpoint to get comprehensive data about an Instagram post."""
@@ -273,7 +342,12 @@ def get_data():
         logger.info("Trying no-login approach since authentication failed")
         post_data, new_error = get_post_data_no_login(url)
         if new_error:
-            return jsonify({"status": "error", "error": new_error}), 500
+            return jsonify({
+                "status": "error", 
+                "error": new_error,
+                "message": "Instagram authentication failed. Please check credentials.",
+                "status_code": "auth_error"
+            }), 500
     elif error:
         # Check if it's a rate limit error
         if "Please wait a few minutes before you try again" in error or "429" in error:
@@ -283,7 +357,12 @@ def get_data():
                 "error": error
             }), 429
         else:
-            return jsonify({"status": "error", "error": error}), 500
+            return jsonify({
+                "status": "error", 
+                "error": error,
+                "message": "Error fetching Instagram data.",
+                "status_code": "general_error"
+            }), 500
     
     # Return data
     return jsonify({
@@ -344,44 +423,46 @@ def health_check():
     return jsonify({
         "status": "ok", 
         "version": "1.2.0",
-        "loginless_mode": True
+        "loginless_mode": not cookie_login_success
     })
 
 # Simple web interface
 @app.route('/', methods=['GET'])
 def index():
-    return '''
+    login_status = "Authenticated with cookies" if cookie_login_success else "Running in login-less mode"
+    
+    return f'''
     <!DOCTYPE html>
     <html>
     <head>
         <title>Instagram Data API</title>
         <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-            .form-group { margin-bottom: 15px; }
-            label { display: block; margin-bottom: 5px; }
-            input[type="text"] { width: 100%; padding: 8px; box-sizing: border-box; }
-            .button-group { display: flex; gap: 10px; margin-bottom: 20px; }
-            button { padding: 10px 15px; background: #3897f0; color: white; border: none; cursor: pointer; }
-            button:hover { background: #2676d9; }
-            .result { margin-top: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
-            pre { background: #f4f4f4; padding: 10px; overflow: auto; }
-            .profile-container { display: flex; align-items: center; margin-top: 15px; }
-            .profile-pic { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; }
-            .profile-info { flex: 1; }
-            .status { padding: 10px; margin-bottom: 15px; border-radius: 5px; }
-            .status.info { background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
-            .tabs { display: flex; margin-bottom: 20px; }
-            .tab { padding: 10px 15px; background: #f0f0f0; cursor: pointer; border: 1px solid #ccc; }
-            .tab.active { background: #3897f0; color: white; border-color: #3897f0; }
-            .embed-container { margin-top: 20px; }
-            iframe { border: none; width: 100%; height: 600px; }
+            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            .form-group {{ margin-bottom: 15px; }}
+            label {{ display: block; margin-bottom: 5px; }}
+            input[type="text"] {{ width: 100%; padding: 8px; box-sizing: border-box; }}
+            .button-group {{ display: flex; gap: 10px; margin-bottom: 20px; }}
+            button {{ padding: 10px 15px; background: #3897f0; color: white; border: none; cursor: pointer; }}
+            button:hover {{ background: #2676d9; }}
+            .result {{ margin-top: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }}
+            pre {{ background: #f4f4f4; padding: 10px; overflow: auto; }}
+            .profile-container {{ display: flex; align-items: center; margin-top: 15px; }}
+            .profile-pic {{ width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; }}
+            .profile-info {{ flex: 1; }}
+            .status {{ padding: 10px; margin-bottom: 15px; border-radius: 5px; }}
+            .status.info {{ background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }}
+            .tabs {{ display: flex; margin-bottom: 20px; }}
+            .tab {{ padding: 10px 15px; background: #f0f0f0; cursor: pointer; border: 1px solid #ccc; }}
+            .tab.active {{ background: #3897f0; color: white; border-color: #3897f0; }}
+            .embed-container {{ margin-top: 20px; }}
+            iframe {{ border: none; width: 100%; height: 600px; }}
         </style>
     </head>
     <body>
         <h1>Instagram Data API</h1>
         
         <div id="status-message" class="status info">
-            Running in login-less mode. Some features may be limited. For videos, use the embed approach.
+            Status: {login_status}. {'' if cookie_login_success else 'Some features may be limited. For videos, use the embed approach.'}
         </div>
         
         <div class="form-group">
@@ -409,7 +490,7 @@ def index():
         <div id="result" class="result" style="display:none;"></div>
         
         <script>
-            function switchTab(tab) {
+            function switchTab(tab) {{
                 // Hide all tabs
                 document.getElementById('data-tab').style.display = 'none';
                 document.getElementById('embed-tab').style.display = 'none';
@@ -423,138 +504,138 @@ def index():
                 
                 // Find the clicked tab and make it active
                 event.target.classList.add('active');
-            }
+            }}
             
-            function getShortcode() {
+            function getShortcode() {{
                 const url = document.getElementById('insta-url').value;
-                if (!url) {
+                if (!url) {{
                     alert('Please enter an Instagram URL');
                     return null;
-                }
+                }}
                 
                 // Extract shortcode
-                const regex = /instagram\.com\/(p|reel|tv)\/([^\/\?]+)/;
+                const regex = /instagram\\.com\\/(p|reel|tv)\\/([^\\/\\?]+)/;
                 const match = url.match(regex);
                 
-                if (match && match[2]) {
+                if (match && match[2]) {{
                     return match[2];
-                } else {
+                }} else {{
                     alert('Invalid Instagram URL');
                     return null;
-                }
-            }
+                }}
+            }}
             
-            function showEmbed() {
+            function showEmbed() {{
                 const shortcode = getShortcode();
                 if (!shortcode) return;
                 
                 const container = document.getElementById('embed-container');
-                container.innerHTML = `<iframe src="https://www.instagram.com/p/${shortcode}/embed/"></iframe>`;
-            }
+                container.innerHTML = `<iframe src="https://www.instagram.com/p/${{shortcode}}/embed/"></iframe>`;
+            }}
             
-            function fetchData() {
+            function fetchData() {{
                 const url = document.getElementById('insta-url').value;
-                if (!url) {
+                if (!url) {{
                     alert('Please enter an Instagram URL');
                     return;
-                }
+                }}
                 
                 const resultDiv = document.getElementById('result');
                 resultDiv.innerHTML = '<p>Loading data...</p>';
                 resultDiv.style.display = 'block';
                 
-                fetch(`/api/data?url=${encodeURIComponent(url)}`)
+                fetch(`/api/data?url=${{encodeURIComponent(url)}}`)
                     .then(response => response.json())
-                    .then(data => {
+                    .then(data => {{
                         let profilePicHtml = '';
-                        if (data.status === 'success' && data.data.owner && data.data.owner.profile_pic_url) {
+                        if (data.status === 'success' && data.data.owner && data.data.owner.profile_pic_url) {{
                             profilePicHtml = `
                                 <div class="profile-container">
-                                    <img src="${data.data.owner.profile_pic_url}" class="profile-pic" alt="Profile Picture">
+                                    <img src="${{data.data.owner.profile_pic_url}}" class="profile-pic" alt="Profile Picture">
                                     <div class="profile-info">
-                                        <strong>${data.data.owner.username}</strong>
-                                        ${data.data.owner.full_name ? `<p>${data.data.owner.full_name}</p>` : ''}
+                                        <strong>${{data.data.owner.username}}</strong>
+                                        ${{data.data.owner.full_name ? `<p>${{data.data.owner.full_name}}</p>` : ''}}
                                     </div>
                                 </div>
                             `;
-                        }
+                        }}
                         
                         let mediaPreview = '';
-                        if (data.status === 'success') {
-                            if (data.data.is_video && data.data.urls.video) {
+                        if (data.status === 'success') {{
+                            if (data.data.is_video && data.data.urls.video) {{
                                 mediaPreview = `
                                     <div style="margin-top: 15px;">
                                         <video controls style="max-width: 100%; max-height: 400px;">
-                                            <source src="${data.data.urls.video}" type="video/mp4">
+                                            <source src="${{data.data.urls.video}}" type="video/mp4">
                                             Your browser does not support the video tag.
                                         </video>
                                     </div>
                                 `;
-                            } else if (!data.data.is_video && data.data.urls.image) {
+                            }} else if (!data.data.is_video && data.data.urls.image) {{
                                 mediaPreview = `
                                     <div style="margin-top: 15px;">
-                                        <img src="${data.data.urls.image}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
+                                        <img src="${{data.data.urls.image}}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
                                     </div>
                                 `;
-                            }
-                        }
+                            }}
+                        }}
                         
                         resultDiv.innerHTML = `
-                            ${profilePicHtml}
-                            ${mediaPreview}
+                            ${{profilePicHtml}}
+                            ${{mediaPreview}}
                             <h3>API Response:</h3>
-                            <pre>${JSON.stringify(data, null, 2)}</pre>
-                            ${data.status === 'success' && data.data.urls.download ? 
-                                `<p><a href="${data.data.urls.download}" target="_blank">Download Media</a></p>` : ''}
+                            <pre>${{JSON.stringify(data, null, 2)}}</pre>
+                            ${{data.status === 'success' && data.data.urls.download ? 
+                                `<p><a href="${{data.data.urls.download}}" target="_blank">Download Media</a></p>` : ''}}
                         `;
-                    })
-                    .catch(error => {
-                        resultDiv.innerHTML = `<p>Error: ${error.message}</p>`;
-                    });
-            }
+                    }})
+                    .catch(error => {{
+                        resultDiv.innerHTML = `<p>Error: ${{error.message}}</p>`;
+                    }});
+            }}
             
-            function fetchDirectData() {
+            function fetchDirectData() {{
                 const url = document.getElementById('insta-url').value;
-                if (!url) {
+                if (!url) {{
                     alert('Please enter an Instagram URL');
                     return;
-                }
+                }}
                 
                 const resultDiv = document.getElementById('result');
                 resultDiv.innerHTML = '<p>Loading data...</p>';
                 resultDiv.style.display = 'block';
                 
-                fetch(`/api/direct-data?url=${encodeURIComponent(url)}`)
+                fetch(`/api/direct-data?url=${{encodeURIComponent(url)}}`)
                     .then(response => response.json())
-                    .then(data => {
+                    .then(data => {{
                         let mediaPreview = '';
-                        if (data.status === 'success') {
-                            if (data.data.urls.image) {
+                        if (data.status === 'success') {{
+                            if (data.data.urls.image) {{
                                 mediaPreview = `
                                     <div style="margin-top: 15px;">
-                                        <img src="${data.data.urls.image}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
+                                        <img src="${{data.data.urls.image}}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
                                     </div>
                                 `;
-                            } else if (data.data.urls.thumbnail) {
+                            }} else if (data.data.urls.thumbnail) {{
                                 mediaPreview = `
                                     <div style="margin-top: 15px;">
-                                        <img src="${data.data.urls.thumbnail}" style="max-width: 100%; max-height: 400px;" alt="Video Thumbnail">
+                                        <img src="${{data.data.urls.thumbnail}}" style="max-width: 100%; max-height: 400px;" alt="Video Thumbnail">
                                         <p><em>Video thumbnail shown. Use embed tab to view the actual video.</em></p>
                                     </div>
                                 `;
-                            }
-                        }
+                            }}
+                        }}
                         
                         resultDiv.innerHTML = `
-                            ${mediaPreview}
+                            ${{mediaPreview}}
                             <h3>API Response:</h3>
-                            <pre>${JSON.stringify(data, null, 2)}</pre>
+                            <pre>${{JSON.stringify(data, null, 2)}}</pre>
                         `;
-                    })
-                    .catch(error => {
-                        resultDiv.innerHTML = `<p>Error: ${error.message}</p>`;
-                    });
-            }
+                    }})
+                    .catch(error => {{
+                        resultDiv.innerHTML = `<p>Error: ${{error.message}}</p>`;
+                    }});
+            }}
         </script>
     </body>
     </html>
