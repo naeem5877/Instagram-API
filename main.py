@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, Response, make_response
 import os
 import re
@@ -9,12 +8,15 @@ import time
 from urllib.parse import urlparse
 from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
+from flask_cors import CORS  # Add this import
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Enable CORS for all routes
+CORS(app)  # Add this line
 # Fix for running behind a proxy
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
