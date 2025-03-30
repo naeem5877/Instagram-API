@@ -398,7 +398,7 @@ def stream_media_by_shortcode(shortcode):
         ydl_opts = {
             'quiet': False,  # Changed to see more logs
             'no_warnings': False,
-            'format': 'best',  # Choose best quality
+            'format': 'bestvideo+bestaudio/best',
             'simulate': True,  # Don't download, just extract info
             'cookiefile': cookie_path if has_cookies else None,
             'verbose': True
