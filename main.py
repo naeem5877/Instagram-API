@@ -19,7 +19,7 @@ app = Flask(__name__)
 # Fix for running behind a proxy
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Configure Instaloader instance with login credentials
+# Configure Instaloader instance
 L = instaloader.Instaloader(
     download_video_thumbnails=False,
     download_geotags=False,
@@ -29,33 +29,6 @@ L = instaloader.Instaloader(
     post_metadata_txt_pattern="",
     max_connection_attempts=3
 )
-
-# Get Instagram credentials from environment variables
-INSTA_USERNAME = os.environ.get("INSTA_USERNAME")
-INSTA_PASSWORD = os.environ.get("INSTA_PASSWORD")
-SESSION_FILE = "instagram_session"
-
-# Login to Instagram
-def login_to_instagram():
-    try:
-        # Try to load session from file
-        if os.path.exists(SESSION_FILE):
-            logger.info("Loading Instagram session from file...")
-            L.load_session_from_file(INSTA_USERNAME, SESSION_FILE)
-            return True
-        # Login with username and password
-        elif INSTA_USERNAME and INSTA_PASSWORD:
-            logger.info(f"Logging in to Instagram as {INSTA_USERNAME}...")
-            L.login(INSTA_USERNAME, INSTA_PASSWORD)
-            # Save session for future use
-            L.save_session_to_file(SESSION_FILE)
-            return True
-        else:
-            logger.warning("No Instagram credentials provided. Some features may not work.")
-            return False
-    except Exception as e:
-        logger.error(f"Instagram login failed: {e}")
-        return False
 
 # Retry decorator for handling rate limits
 def retry_with_backoff(max_retries=3, initial_backoff=2):
@@ -94,6 +67,84 @@ def extract_shortcode_from_url(url):
     shortcode = path.split('/')[-1]
     
     return shortcode
+
+# Alternative method to get post data without login
+def get_post_data_no_login(url):
+    """Get basic data about an Instagram post without requiring login."""
+    try:
+        # Extract shortcode from URL
+        shortcode = extract_shortcode_from_url(url)
+        logger.info(f"Extracted shortcode: {shortcode}")
+        
+        # Use instagram-scraper instead of full Instaloader API
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache"
+        }
+        
+        # Fetch the Instagram page
+        response = requests.get(f"https://www.instagram.com/p/{shortcode}/embed/", headers=headers)
+        response.raise_for_status()
+        
+        html_content = response.text
+        
+        # Basic data we can extract from embed page
+        post_data = {
+            "shortcode": shortcode,
+            "urls": {}
+        }
+        
+        # Try to determine if it's video
+        is_video = 'video' in html_content.lower() and 'poster=' in html_content.lower()
+        post_data["is_video"] = is_video
+        
+        # Try to get username
+        username_match = re.search(r'@([A-Za-z0-9._]+)', html_content)
+        if username_match:
+            username = username_match.group(1)
+            post_data["owner"] = {
+                "username": username,
+                "profile_url": f"https://www.instagram.com/{username}/"
+            }
+        
+        # Try to extract caption
+        caption_match = re.search(r'<p>(.*?)</p>', html_content, re.DOTALL)
+        if caption_match:
+            caption = caption_match.group(1)
+            # Clean HTML tags
+            caption = re.sub(r'<.*?>', '', caption)
+            post_data["caption"] = caption
+        
+        # Construct URLs for our API endpoints
+        base_url = request.host_url.rstrip('/')
+        post_data["urls"]["embed"] = f"https://www.instagram.com/p/{shortcode}/embed/"
+        post_data["urls"]["instagram"] = f"https://www.instagram.com/p/{shortcode}/"
+        
+        # Add media URL if we can find it (works better for images than videos)
+        img_match = re.search(r'<img[^>]+src="([^"]+)"[^>]+class="[^"]*(?:EmbeddedMediaImage|post-media)[^"]*"', html_content)
+        if img_match:
+            post_data["urls"]["image"] = img_match.group(1)
+        
+        video_match = re.search(r'<video[^>]+poster="([^"]+)"', html_content)
+        if video_match:
+            post_data["urls"]["thumbnail"] = video_match.group(1)
+        
+        # Note: We can't reliably get video URLs without login, but we can provide embed page
+        
+        return post_data, None
+    
+    except Exception as e:
+        logger.error(f"Error fetching post data: {e}")
+        return None, f"Error: {str(e)}"
 
 @retry_with_backoff()
 def get_post_data(url):
@@ -214,19 +265,16 @@ def get_data():
     if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
         return jsonify({"error": "Invalid Instagram URL"}), 400
     
-    # Make sure we're logged in
-    if not hasattr(L.context, "username"):
-        login_success = login_to_instagram()
-        if not login_success and (INSTA_USERNAME and INSTA_PASSWORD):
-            return jsonify({
-                "status": "error", 
-                "error": "Failed to authenticate with Instagram. Check your credentials."
-            }), 500
-    
-    # Get post data
+    # Try first with Instaloader
     post_data, error = get_post_data(url)
     
-    if error:
+    # If we get 401 unauthorized, try the no-login approach
+    if error and ('401' in error or 'login' in error.lower() or 'authenticate' in error.lower()):
+        logger.info("Trying no-login approach since authentication failed")
+        post_data, new_error = get_post_data_no_login(url)
+        if new_error:
+            return jsonify({"status": "error", "error": new_error}), 500
+    elif error:
         # Check if it's a rate limit error
         if "Please wait a few minutes before you try again" in error or "429" in error:
             return jsonify({
@@ -234,19 +282,6 @@ def get_data():
                 "message": "Instagram is rate limiting our requests. Please try again in a few minutes.",
                 "error": error
             }), 429
-        elif "401" in error or "login" in error.lower() or "authenticate" in error.lower():
-            # Try to login again
-            login_success = login_to_instagram()
-            if login_success:
-                # Retry the request after logging in
-                post_data, error = get_post_data(url)
-                if error:
-                    return jsonify({"status": "error", "error": error}), 500
-            else:
-                return jsonify({
-                    "status": "error", 
-                    "error": "Authentication required. Please set INSTA_USERNAME and INSTA_PASSWORD environment variables."
-                }), 401
         else:
             return jsonify({"status": "error", "error": error}), 500
     
@@ -256,36 +291,9 @@ def get_data():
         "data": post_data
     })
 
-@app.route('/api/media/stream/<shortcode>', methods=['GET'])
-def stream_media_endpoint(shortcode):
-    """API endpoint to stream Instagram media directly without saving to disk."""
-    try:
-        # Make sure we're logged in
-        if not hasattr(L.context, "username"):
-            login_success = login_to_instagram()
-        
-        # Get post by shortcode
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        
-        # For videos
-        if post.is_video:
-            video_url = post.video_url
-            return stream_media(video_url, "video/mp4")
-        # For images
-        else:
-            image_url = post.url
-            return stream_media(image_url, "image/jpeg")
-    
-    except instaloader.exceptions.InstaloaderException as e:
-        logger.error(f"Instaloader error: {e}")
-        return jsonify({"error": f"Instaloader error: {str(e)}"}), 500
-    except Exception as e:
-        logger.error(f"General error: {e}")
-        return jsonify({"error": f"Error: {str(e)}"}), 500
-
 @app.route('/api/direct-data', methods=['GET'])
 def get_direct_data():
-    """API endpoint to get direct video URL without profile info (less prone to rate limiting)."""
+    """API endpoint to get direct media URLs without full post details."""
     # Get URL from query parameter
     url = request.args.get('url')
     
@@ -296,51 +304,39 @@ def get_direct_data():
     if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
         return jsonify({"error": "Invalid Instagram URL"}), 400
     
-    # Make sure we're logged in
-    if not hasattr(L.context, "username"):
-        login_success = login_to_instagram()
+    # Extract shortcode
+    shortcode = extract_shortcode_from_url(url)
     
+    # Try to get data using no-login approach
+    post_data, error = get_post_data_no_login(url)
+    
+    if error:
+        return jsonify({"status": "error", "error": error}), 500
+    
+    # Return simplified response
+    return jsonify({
+        "status": "success",
+        "data": post_data
+    })
+
+@app.route('/api/embed/<shortcode>', methods=['GET'])
+def get_embed(shortcode):
+    """Return embed HTML for an Instagram post."""
     try:
-        # Extract shortcode from URL
-        shortcode = extract_shortcode_from_url(url)
-        logger.info(f"Extracted shortcode: {shortcode}")
-        
-        # Get post by shortcode
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        
-        # Create direct response with just the critical data
-        response_data = {
-            "status": "success",
-            "data": {
-                "shortcode": post.shortcode,
-                "is_video": post.is_video,
-                "urls": {}
-            }
+        # Fetch the embed HTML from Instagram
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         
-        # Add URLs
-        if post.is_video:
-            response_data["data"]["urls"]["video"] = post.video_url
-            response_data["data"]["urls"]["thumbnail"] = post.url
-        else:
-            response_data["data"]["urls"]["image"] = post.url
+        response = requests.get(f"https://www.instagram.com/p/{shortcode}/embed/", headers=headers)
+        response.raise_for_status()
         
-        # Add streaming endpoint URL
-        base_url = request.host_url.rstrip('/')
-        response_data["data"]["urls"]["download"] = f"{base_url}/api/media/stream/{post.shortcode}"
-        
-        # Try to get profile picture
-        try:
-            profile = instaloader.Profile.from_username(L.context, post.owner_username)
-            response_data["data"]["profile_pic"] = profile.profile_pic_url
-        except Exception as e:
-            logger.warning(f"Could not fetch profile picture: {e}")
-        
-        return jsonify(response_data)
-        
+        # Return the embed HTML
+        return response.text
+    
     except Exception as e:
-        logger.error(f"Error in direct-data endpoint: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        logger.error(f"Embed error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # Health check endpoint
 @app.route('/health', methods=['GET'])
@@ -348,30 +344,8 @@ def health_check():
     return jsonify({
         "status": "ok", 
         "version": "1.2.0",
-        "authenticated": hasattr(L.context, "username"),
-        "username": L.context.username if hasattr(L.context, "username") else None
+        "loginless_mode": True
     })
-
-# Login status and attempt endpoint
-@app.route('/login', methods=['GET'])
-def login_status():
-    if hasattr(L.context, "username"):
-        return jsonify({
-            "status": "authenticated",
-            "username": L.context.username
-        })
-    else:
-        success = login_to_instagram()
-        if success:
-            return jsonify({
-                "status": "authenticated",
-                "username": L.context.username
-            })
-        else:
-            return jsonify({
-                "status": "not_authenticated",
-                "message": "Could not authenticate. Check environment variables."
-            }), 401
 
 # Simple web interface
 @app.route('/', methods=['GET'])
@@ -395,46 +369,88 @@ def index():
             .profile-pic { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; }
             .profile-info { flex: 1; }
             .status { padding: 10px; margin-bottom: 15px; border-radius: 5px; }
-            .status.ok { background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
-            .status.error { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+            .status.info { background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
+            .tabs { display: flex; margin-bottom: 20px; }
+            .tab { padding: 10px 15px; background: #f0f0f0; cursor: pointer; border: 1px solid #ccc; }
+            .tab.active { background: #3897f0; color: white; border-color: #3897f0; }
+            .embed-container { margin-top: 20px; }
+            iframe { border: none; width: 100%; height: 600px; }
         </style>
     </head>
     <body>
         <h1>Instagram Data API</h1>
         
-        <div id="login-status" class="status">Checking login status...</div>
+        <div id="status-message" class="status info">
+            Running in login-less mode. Some features may be limited. For videos, use the embed approach.
+        </div>
         
         <div class="form-group">
             <label for="insta-url">Enter Instagram URL:</label>
             <input type="text" id="insta-url" placeholder="https://www.instagram.com/p/SHORTCODE/">
         </div>
-        <div class="button-group">
-            <button onclick="fetchData()">Get Full Data</button>
-            <button onclick="fetchDirectData()">Get Direct Media URL</button>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('data')">Get Data</div>
+            <div class="tab" onclick="switchTab('embed')">View Embed</div>
         </div>
+        
+        <div id="data-tab">
+            <div class="button-group">
+                <button onclick="fetchData()">Get Media Data</button>
+                <button onclick="fetchDirectData()">Get Basic Data</button>
+            </div>
+        </div>
+        
+        <div id="embed-tab" style="display:none;">
+            <button onclick="showEmbed()">Load Embed</button>
+            <div class="embed-container" id="embed-container"></div>
+        </div>
+        
         <div id="result" class="result" style="display:none;"></div>
         
         <script>
-            // Check login status on page load
-            document.addEventListener('DOMContentLoaded', function() {
-                fetch('/login')
-                    .then(response => response.json())
-                    .then(data => {
-                        const statusDiv = document.getElementById('login-status');
-                        if (data.status === 'authenticated') {
-                            statusDiv.className = 'status ok';
-                            statusDiv.innerHTML = `Authenticated as <strong>${data.username}</strong>`;
-                        } else {
-                            statusDiv.className = 'status error';
-                            statusDiv.innerHTML = 'Not authenticated. Instagram API features may not work properly.';
-                        }
-                    })
-                    .catch(error => {
-                        const statusDiv = document.getElementById('login-status');
-                        statusDiv.className = 'status error';
-                        statusDiv.innerHTML = `Error checking authentication: ${error.message}`;
-                    });
-            });
+            function switchTab(tab) {
+                // Hide all tabs
+                document.getElementById('data-tab').style.display = 'none';
+                document.getElementById('embed-tab').style.display = 'none';
+                
+                // Show selected tab
+                document.getElementById(tab + '-tab').style.display = 'block';
+                
+                // Update active tab styling
+                const tabs = document.querySelectorAll('.tab');
+                tabs.forEach(t => t.classList.remove('active'));
+                
+                // Find the clicked tab and make it active
+                event.target.classList.add('active');
+            }
+            
+            function getShortcode() {
+                const url = document.getElementById('insta-url').value;
+                if (!url) {
+                    alert('Please enter an Instagram URL');
+                    return null;
+                }
+                
+                // Extract shortcode
+                const regex = /instagram\.com\/(p|reel|tv)\/([^\/\?]+)/;
+                const match = url.match(regex);
+                
+                if (match && match[2]) {
+                    return match[2];
+                } else {
+                    alert('Invalid Instagram URL');
+                    return null;
+                }
+            }
+            
+            function showEmbed() {
+                const shortcode = getShortcode();
+                if (!shortcode) return;
+                
+                const container = document.getElementById('embed-container');
+                container.innerHTML = `<iframe src="https://www.instagram.com/p/${shortcode}/embed/"></iframe>`;
+            }
             
             function fetchData() {
                 const url = document.getElementById('insta-url').value;
@@ -463,11 +479,32 @@ def index():
                             `;
                         }
                         
+                        let mediaPreview = '';
+                        if (data.status === 'success') {
+                            if (data.data.is_video && data.data.urls.video) {
+                                mediaPreview = `
+                                    <div style="margin-top: 15px;">
+                                        <video controls style="max-width: 100%; max-height: 400px;">
+                                            <source src="${data.data.urls.video}" type="video/mp4">
+                                            Your browser does not support the video tag.
+                                        </video>
+                                    </div>
+                                `;
+                            } else if (!data.data.is_video && data.data.urls.image) {
+                                mediaPreview = `
+                                    <div style="margin-top: 15px;">
+                                        <img src="${data.data.urls.image}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
+                                    </div>
+                                `;
+                            }
+                        }
+                        
                         resultDiv.innerHTML = `
                             ${profilePicHtml}
+                            ${mediaPreview}
                             <h3>API Response:</h3>
                             <pre>${JSON.stringify(data, null, 2)}</pre>
-                            ${data.status === 'success' ? 
+                            ${data.status === 'success' && data.data.urls.download ? 
                                 `<p><a href="${data.data.urls.download}" target="_blank">Download Media</a></p>` : ''}
                         `;
                     })
@@ -490,23 +527,28 @@ def index():
                 fetch(`/api/direct-data?url=${encodeURIComponent(url)}`)
                     .then(response => response.json())
                     .then(data => {
-                        let profilePicHtml = '';
-                        if (data.status === 'success' && data.data.profile_pic) {
-                            profilePicHtml = `
-                                <div class="profile-container">
-                                    <img src="${data.data.profile_pic}" class="profile-pic" alt="Profile Picture">
-                                </div>
-                            `;
+                        let mediaPreview = '';
+                        if (data.status === 'success') {
+                            if (data.data.urls.image) {
+                                mediaPreview = `
+                                    <div style="margin-top: 15px;">
+                                        <img src="${data.data.urls.image}" style="max-width: 100%; max-height: 400px;" alt="Instagram Image">
+                                    </div>
+                                `;
+                            } else if (data.data.urls.thumbnail) {
+                                mediaPreview = `
+                                    <div style="margin-top: 15px;">
+                                        <img src="${data.data.urls.thumbnail}" style="max-width: 100%; max-height: 400px;" alt="Video Thumbnail">
+                                        <p><em>Video thumbnail shown. Use embed tab to view the actual video.</em></p>
+                                    </div>
+                                `;
+                            }
                         }
                         
                         resultDiv.innerHTML = `
-                            ${profilePicHtml}
+                            ${mediaPreview}
                             <h3>API Response:</h3>
                             <pre>${JSON.stringify(data, null, 2)}</pre>
-                            ${data.status === 'success' ? 
-                                `<p><a href="${data.data.urls.download}" target="_blank">Download Media</a></p>
-                                ${data.data.is_video ? 
-                                  `<p><strong>Direct Video URL:</strong> <a href="${data.data.urls.video}" target="_blank">${data.data.urls.video}</a></p>` : ''}` : ''}
                         `;
                     })
                     .catch(error => {
@@ -518,20 +560,10 @@ def index():
     </html>
     '''
 
-# Initialize: Try to login on application startup
-@app.before_first_request
-def initialize():
-    login_to_instagram()
-
 # For deployment
 if __name__ == '__main__':
     # Get port from environment variable or use default
     port = int(os.environ.get('PORT', 8080))
-    
-    # Auto-login on startup
-    login_success = login_to_instagram()
-    if login_success:
-        logger.info(f"Successfully logged in as {L.context.username}")
     
     # Use Gunicorn or another WSGI server in production
     if os.environ.get('FLASK_ENV') == 'development':
