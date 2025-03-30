@@ -1,15 +1,13 @@
 from flask import Flask, request, jsonify, Response, make_response
-import instaloader
 import os
 import re
 import requests
-from urllib.parse import urlparse
 import logging
-import hashlib
-from datetime import datetime, timedelta
-import io
+import json
 import time
+from urllib.parse import urlparse
 from werkzeug.middleware.proxy_fix import ProxyFix
+import yt_dlp
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,55 +17,7 @@ app = Flask(__name__)
 # Fix for running behind a proxy
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Configure Instaloader instance
-L = instaloader.Instaloader(
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    post_metadata_txt_pattern="",
-    max_connection_attempts=3
-)
-
-# Load session from cookie file
-try:
-    cookie_file = os.environ.get('INSTAGRAM_COOKIE_FILE', 'cookie.txt')
-    instagram_username = os.environ.get('INSTAGRAM_USERNAME', 'na.ru.to_uzumaki_')
-    
-    if os.path.exists(cookie_file) and instagram_username:
-        L.load_session_from_file(instagram_username, cookie_file)
-        logger.info(f"Successfully loaded session for user {instagram_username} from cookie file")
-    else:
-        logger.warning("Cookie file not found or username not provided. Running in login-less mode.")
-except Exception as e:
-    logger.warning(f"Could not load Instagram session from cookies: {e}")
-    logger.warning("Running in login-less mode. Some features may be limited.")
-
-# Retry decorator for handling rate limits
-def retry_with_backoff(max_retries=3, initial_backoff=2):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            retries = 0
-            backoff = initial_backoff
-            
-            while retries < max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except instaloader.exceptions.InstaloaderException as e:
-                    if "429" in str(e) or "rate limit" in str(e).lower() or "please wait" in str(e).lower():
-                        retries += 1
-                        if retries >= max_retries:
-                            raise
-                        
-                        sleep_time = backoff * (2 ** (retries - 1))
-                        logger.warning(f"Rate limited. Retrying in {sleep_time} seconds... (Attempt {retries}/{max_retries})")
-                        time.sleep(sleep_time)
-                    else:
-                        raise
-        return wrapper
-    return decorator
-
+# Function to extract shortcode from Instagram URL
 def extract_shortcode_from_url(url):
     """Extract the Instagram shortcode from a URL."""
     # Parse URL path
@@ -82,6 +32,30 @@ def extract_shortcode_from_url(url):
     
     return shortcode
 
+# Retry decorator for handling rate limits
+def retry_with_backoff(max_retries=3, initial_backoff=2):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            retries = 0
+            backoff = initial_backoff
+            
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if "429" in str(e) or "rate limit" in str(e).lower() or "please wait" in str(e).lower():
+                        retries += 1
+                        if retries >= max_retries:
+                            raise
+                        
+                        sleep_time = backoff * (2 ** (retries - 1))
+                        logger.warning(f"Rate limited. Retrying in {sleep_time} seconds... (Attempt {retries}/{max_retries})")
+                        time.sleep(sleep_time)
+                    else:
+                        raise
+        return wrapper
+    return decorator
+
 # Alternative method to get post data without login
 def get_post_data_no_login(url):
     """Get basic data about an Instagram post without requiring login."""
@@ -90,7 +64,7 @@ def get_post_data_no_login(url):
         shortcode = extract_shortcode_from_url(url)
         logger.info(f"Extracted shortcode: {shortcode}")
         
-        # Use instagram-scraper instead of full Instaloader API
+        # Use instagram-scraper instead of full API
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -152,8 +126,6 @@ def get_post_data_no_login(url):
         if video_match:
             post_data["urls"]["thumbnail"] = video_match.group(1)
         
-        # Note: We can't reliably get video URLs without login, but we can provide embed page
-        
         return post_data, None
     
     except Exception as e:
@@ -161,82 +133,128 @@ def get_post_data_no_login(url):
         return None, f"Error: {str(e)}"
 
 @retry_with_backoff()
-def get_post_data(url):
-    """Get comprehensive data about an Instagram post."""
+def get_post_data_ytdlp(url):
+    """Get comprehensive data about an Instagram post using yt-dlp."""
     try:
         # Extract shortcode from URL
         shortcode = extract_shortcode_from_url(url)
         logger.info(f"Extracted shortcode: {shortcode}")
         
-        # Get post by shortcode
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        
-        # Base post data
-        post_data = {
-            "id": post.mediaid,
-            "shortcode": post.shortcode,
-            "is_video": post.is_video,
-            "title": post.title,
-            "caption": post.caption,
-            "date_posted": post.date_local.isoformat(),
-            "likes": post.likes,
-            "comments_count": post.comments,
-            "video_duration": post.video_duration if post.is_video else None,
-            "location": post.location,
-            "hashtags": list(post.caption_hashtags) if post.caption else [],
-            "mentions": list(post.caption_mentions) if post.caption else [],
-            "is_sponsored": post.is_sponsored,
-            "urls": {},
-            "owner": {
-                "username": post.owner_username,
-                "id": post.owner_id,
-                "profile_url": f"https://www.instagram.com/{post.owner_username}/"
-            }
+        # Create yt-dlp options
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+            'simulate': True,  # Don't download, just extract info
+            'force_generic_extractor': False,
+            'ignoreerrors': False,
+            'nocheckcertificate': True,
+            'socket_timeout': 30,
+            'cookiefile': 'cookie.txt' if os.path.exists('cookie.txt') else None,
         }
         
-        # Add URLs
-        if post.is_video:
-            post_data["urls"]["video"] = post.video_url
-            post_data["urls"]["thumbnail"] = post.url
+        # Extract info using yt-dlp
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
             
-            # Generate direct URL (no download token needed now that we're streaming)
-            base_url = request.host_url.rstrip('/')
-            post_data["urls"]["download"] = f"{base_url}/api/media/stream/{post.shortcode}"
+        logger.info(f"Successfully extracted info for {shortcode}")
+        
+        # If it's a playlist (carousel), get the first entry
+        if info.get('_type') == 'playlist':
+            entries = info.get('entries', [])
+            if not entries:
+                raise Exception("No entries found in carousel")
+            
+            # Store carousel info
+            carousel_data = {
+                "is_carousel": True,
+                "carousel_items": []
+            }
+            
+            # Process each carousel item
+            for entry in entries:
+                carousel_item = extract_media_info(entry)
+                carousel_data["carousel_items"].append(carousel_item)
+            
+            # Use the first item as the main post data
+            post_data = extract_media_info(entries[0])
+            post_data.update(carousel_data)
         else:
-            post_data["urls"]["image"] = post.url
-            post_data["urls"]["download"] = f"{request.host_url.rstrip('/')}/api/media/stream/{post.shortcode}"
+            # Single post
+            post_data = extract_media_info(info)
+            post_data["is_carousel"] = False
         
-        post_data["urls"]["instagram"] = f"https://www.instagram.com/p/{post.shortcode}/"
+        # Add Instagram direct link
+        post_data["urls"]["instagram"] = f"https://www.instagram.com/p/{shortcode}/"
+        post_data["shortcode"] = shortcode
         
-        # Try to add additional owner information, but don't fail if it's not available
-        try:
-            owner_profile = post.owner_profile
-            post_data["owner"].update({
-                "is_verified": owner_profile.is_verified if hasattr(owner_profile, 'is_verified') else None,
-                "full_name": owner_profile.full_name if hasattr(owner_profile, 'full_name') else None,
-                "biography": owner_profile.biography if hasattr(owner_profile, 'biography') else None,
-                "followers_count": owner_profile.followers if hasattr(owner_profile, 'followers') else None,
-                "following_count": owner_profile.followees if hasattr(owner_profile, 'followees') else None,
-                "profile_pic_url": owner_profile.profile_pic_url if hasattr(owner_profile, 'profile_pic_url') else None
-            })
-        except Exception as profile_error:
-            logger.warning(f"Could not fetch complete profile data: {profile_error}")
-            
-            # Try to get at least the profile picture directly
-            try:
-                profile = instaloader.Profile.from_username(L.context, post.owner_username)
-                post_data["owner"]["profile_pic_url"] = profile.profile_pic_url
-            except Exception as pic_error:
-                logger.warning(f"Could not fetch profile picture: {pic_error}")
+        # Add direct download URL through our API
+        base_url = request.host_url.rstrip('/')
+        post_data["urls"]["download"] = f"{base_url}/api/media/stream/{shortcode}"
         
         return post_data, None
     
-    except instaloader.exceptions.InstaloaderException as e:
-        logger.error(f"Instaloader error: {e}")
-        return None, f"Instaloader error: {str(e)}"
     except Exception as e:
-        logger.error(f"General error: {e}")
-        return None, f"Error: {str(e)}"
+        logger.error(f"yt-dlp error: {e}")
+        return None, f"yt-dlp error: {str(e)}"
+
+def extract_media_info(info):
+    """Extract relevant media information from yt-dlp info dict."""
+    # Base post data
+    post_data = {
+        "id": info.get('id', ''),
+        "title": info.get('title', ''),
+        "description": info.get('description', ''),
+        "is_video": info.get('ext') == 'mp4',
+        "upload_date": info.get('upload_date', ''),
+        "view_count": info.get('view_count', 0),
+        "like_count": info.get('like_count', 0),
+        "comment_count": info.get('comment_count', 0),
+        "duration": info.get('duration', None) if info.get('ext') == 'mp4' else None,
+        "urls": {},
+        "owner": {
+            "username": info.get('uploader', ''),
+            "uploader_id": info.get('uploader_id', ''),
+            "uploader_url": info.get('uploader_url', '')
+        }
+    }
+    
+    # Extract hashtags from description
+    if post_data["description"]:
+        post_data["hashtags"] = re.findall(r'#(\w+)', post_data["description"])
+    else:
+        post_data["hashtags"] = []
+        
+    # Extract mentions from description
+    if post_data["description"]:
+        post_data["mentions"] = re.findall(r'@(\w+)', post_data["description"])
+    else:
+        post_data["mentions"] = []
+    
+    # Add media URLs
+    if post_data["is_video"]:
+        if 'formats' in info and info['formats']:
+            # Get the best quality video URL
+            best_video = None
+            best_quality = -1
+            
+            for fmt in info['formats']:
+                if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
+                    best_quality = fmt.get('height', 0)
+                    best_video = fmt
+            
+            if best_video:
+                post_data["urls"]["video"] = best_video.get('url')
+                post_data["urls"]["thumbnail"] = info.get('thumbnail')
+        else:
+            # Fallback to the direct URL if formats aren't available
+            post_data["urls"]["video"] = info.get('url')
+            post_data["urls"]["thumbnail"] = info.get('thumbnail')
+    else:
+        # Image post
+        post_data["urls"]["image"] = info.get('url')
+    
+    return post_data
 
 def stream_media(url, content_type):
     """Stream media from URL without saving to disk."""
@@ -266,31 +284,62 @@ def stream_media(url, content_type):
         logger.error(f"Streaming error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Add missing endpoint for streaming media
 @app.route('/api/media/stream/<shortcode>', methods=['GET'])
-def stream_media_endpoint(shortcode):
-    """Endpoint to stream media directly from Instagram."""
+def stream_media_by_shortcode(shortcode):
+    """Stream media directly by shortcode."""
     try:
-        # Get the post by shortcode
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        # Get post data first
+        url = f"https://www.instagram.com/p/{shortcode}/"
         
-        # Determine URL and content type based on post type
-        if post.is_video:
-            url = post.video_url
-            content_type = 'video/mp4'
-        else:
-            url = post.url
-            content_type = 'image/jpeg'
+        # Use yt-dlp to get the direct URL
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'best',  # Choose best quality
+            'simulate': True,  # Don't download, just extract info
+            'cookiefile': 'cookie.txt' if os.path.exists('cookie.txt') else None,
+        }
         
-        # Stream the media
-        return stream_media(url, content_type)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # If it's a playlist (carousel), get the first entry
+            if info.get('_type') == 'playlist' and info.get('entries'):
+                media_info = info['entries'][0]
+            else:
+                media_info = info
+                
+            # Determine content type and URL
+            is_video = media_info.get('ext') == 'mp4'
+            
+            if is_video:
+                content_type = "video/mp4"
+                if 'formats' in media_info and media_info['formats']:
+                    # Get the best quality video
+                    best_video = None
+                    best_quality = -1
+                    
+                    for fmt in media_info['formats']:
+                        if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
+                            best_quality = fmt.get('height', 0)
+                            best_video = fmt
+                    
+                    if best_video:
+                        media_url = best_video.get('url')
+                    else:
+                        media_url = media_info.get('url')
+                else:
+                    media_url = media_info.get('url')
+            else:
+                content_type = "image/jpeg"
+                media_url = media_info.get('url')
+            
+            # Stream the media
+            return stream_media(media_url, content_type)
     
     except Exception as e:
-        logger.error(f"Error streaming media: {e}")
-        return jsonify({
-            "status": "error",
-            "error": f"Could not stream media: {str(e)}"
-        }), 500
+        logger.error(f"Streaming error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/data', methods=['GET'])
 def get_data():
@@ -305,29 +354,20 @@ def get_data():
     if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
         return jsonify({"error": "Invalid Instagram URL"}), 400
     
-    # Try first with Instaloader
-    post_data, error = get_post_data(url)
+    # Try first with yt-dlp
+    post_data, error = get_post_data_ytdlp(url)
     
-    # If we get 401 unauthorized, try the no-login approach
-    if error and ('401' in error or 'login' in error.lower() or 'authenticate' in error.lower()):
-        logger.info("Trying no-login approach since authentication failed")
+    # If we get an error, try the no-login approach
+    if error:
+        logger.info("Trying no-login approach since yt-dlp extraction failed")
         post_data, new_error = get_post_data_no_login(url)
         if new_error:
             return jsonify({
-                "status": "auth_error",
-                "error": "Authentication failed. Please check Instagram credentials.",
-                "message": "Instagram authentication failed. Please check credentials."
-            }), 401
-    elif error:
-        # Check if it's a rate limit error
-        if "Please wait a few minutes before you try again" in error or "429" in error:
-            return jsonify({
-                "status": "limited",
-                "message": "Instagram is rate limiting our requests. Please try again in a few minutes.",
-                "error": error
-            }), 429
-        else:
-            return jsonify({"status": "error", "error": error}), 500
+                "status": "error", 
+                "error": new_error,
+                "message": "Failed to extract data from Instagram.",
+                "status_code": "error"
+            }), 500
     
     # Return data
     return jsonify({
@@ -382,38 +422,95 @@ def get_embed(shortcode):
         logger.error(f"Embed error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/download', methods=['GET'])
+def download_media():
+    """API endpoint to download media directly."""
+    # Get URL from query parameter
+    url = request.args.get('url')
+    
+    if not url:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    # Validate Instagram URL
+    if not re.match(r'^https?://(www\.)?instagram\.com/(p|reel|tv)/[^/]+/?.*$', url):
+        return jsonify({"error": "Invalid Instagram URL"}), 400
+    
+    try:
+        # Extract shortcode
+        shortcode = extract_shortcode_from_url(url)
+        
+        # Use yt-dlp to get the direct URL
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'best',  # Choose best quality
+            'simulate': True,  # Don't download, just extract info
+            'cookiefile': 'cookie.txt' if os.path.exists('cookie.txt') else None,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # If it's a playlist (carousel), get the first entry
+            if info.get('_type') == 'playlist' and info.get('entries'):
+                media_info = info['entries'][0]
+            else:
+                media_info = info
+                
+            # Determine content type and URL
+            is_video = media_info.get('ext') == 'mp4'
+            
+            if is_video:
+                content_type = "video/mp4"
+                if 'formats' in media_info and media_info['formats']:
+                    # Get the best quality video
+                    best_video = None
+                    best_quality = -1
+                    
+                    for fmt in media_info['formats']:
+                        if fmt.get('ext') == 'mp4' and fmt.get('height', 0) > best_quality:
+                            best_quality = fmt.get('height', 0)
+                            best_video = fmt
+                    
+                    if best_video:
+                        media_url = best_video.get('url')
+                    else:
+                        media_url = media_info.get('url')
+                else:
+                    media_url = media_info.get('url')
+            else:
+                content_type = "image/jpeg"
+                media_url = media_info.get('url')
+            
+            # Stream the media
+            return stream_media(media_url, content_type)
+    
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # Health check endpoint
 @app.route('/health', methods=['GET'])
 def health_check():
-    # Check if we have a valid Instagram session
-    is_logged_in = L.context.is_logged_in
-    
+    has_cookies = os.path.exists('cookie.txt')
     return jsonify({
         "status": "ok", 
-        "version": "1.2.0",
-        "instagram_login_status": "logged_in" if is_logged_in else "not_logged_in",
-        "loginless_mode": not is_logged_in
+        "version": "2.0.0",
+        "using_ytdlp": True,
+        "cookie_file": has_cookies
     })
 
 # Simple web interface
 @app.route('/', methods=['GET'])
 def index():
-    # Check if we have a valid Instagram session
-    is_logged_in = L.context.is_logged_in
-    status_message = ""
-    
-    if is_logged_in:
-        status_message = "Running with Instagram authentication. Full features available."
-        status_class = "success"
-    else:
-        status_message = "Running in login-less mode. Some features may be limited. For videos, use the embed approach."
-        status_class = "info"
+    has_cookies = os.path.exists('cookie.txt')
+    login_status = "Using cookies for authentication" if has_cookies else "Running in login-less mode"
     
     return f'''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Instagram Data API</title>
+        <title>Instagram Media Downloader (yt-dlp)</title>
         <style>
             body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
             .form-group {{ margin-bottom: 15px; }}
@@ -429,7 +526,6 @@ def index():
             .profile-info {{ flex: 1; }}
             .status {{ padding: 10px; margin-bottom: 15px; border-radius: 5px; }}
             .status.info {{ background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }}
-            .status.success {{ background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }}
             .tabs {{ display: flex; margin-bottom: 20px; }}
             .tab {{ padding: 10px 15px; background: #f0f0f0; cursor: pointer; border: 1px solid #ccc; }}
             .tab.active {{ background: #3897f0; color: white; border-color: #3897f0; }}
@@ -438,10 +534,10 @@ def index():
         </style>
     </head>
     <body>
-        <h1>Instagram Data API</h1>
+        <h1>Instagram Media Downloader (yt-dlp)</h1>
         
-        <div id="status-message" class="status {status_class}">
-            {status_message}
+        <div id="status-message" class="status info">
+            Status: {login_status}
         </div>
         
         <div class="form-group">
@@ -451,14 +547,22 @@ def index():
         
         <div class="tabs">
             <div class="tab active" onclick="switchTab('data')">Get Data</div>
+            <div class="tab" onclick="switchTab('download')">Download</div>
             <div class="tab" onclick="switchTab('embed')">View Embed</div>
         </div>
         
         <div id="data-tab">
             <div class="button-group">
-                <button onclick="fetchData()">Get Media Data</button>
+                <button onclick="fetchData()">Get Full Media Data</button>
                 <button onclick="fetchDirectData()">Get Basic Data</button>
             </div>
+        </div>
+
+        <div id="download-tab" style="display:none;">
+            <div class="button-group">
+                <button onclick="downloadMedia()">Download Media</button>
+            </div>
+            <p>This will download the highest quality version of the image or video.</p>
         </div>
         
         <div id="embed-tab" style="display:none;">
@@ -472,6 +576,7 @@ def index():
             function switchTab(tab) {{
                 // Hide all tabs
                 document.getElementById('data-tab').style.display = 'none';
+                document.getElementById('download-tab').style.display = 'none';
                 document.getElementById('embed-tab').style.display = 'none';
                 
                 // Show selected tab
@@ -527,13 +632,11 @@ def index():
                     .then(response => response.json())
                     .then(data => {{
                         let profilePicHtml = '';
-                        if (data.status === 'success' && data.data.owner && data.data.owner.profile_pic_url) {{
+                        if (data.status === 'success' && data.data.owner && data.data.owner.username) {{
                             profilePicHtml = `
                                 <div class="profile-container">
-                                    <img src="${{data.data.owner.profile_pic_url}}" class="profile-pic" alt="Profile Picture">
                                     <div class="profile-info">
                                         <strong>${{data.data.owner.username}}</strong>
-                                        ${{data.data.owner.full_name ? `<p>${{data.data.owner.full_name}}</p>` : ''}}
                                     </div>
                                 </div>
                             `;
@@ -614,6 +717,17 @@ def index():
                     .catch(error => {{
                         resultDiv.innerHTML = `<p>Error: ${{error.message}}</p>`;
                     }});
+            }}
+            
+            function downloadMedia() {{
+                const url = document.getElementById('insta-url').value;
+                if (!url) {{
+                    alert('Please enter an Instagram URL');
+                    return;
+                }}
+                
+                // Redirect to the download endpoint
+                window.location.href = `/api/download?url=${{encodeURIComponent(url)}}`;
             }}
         </script>
     </body>
