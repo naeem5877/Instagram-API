@@ -282,12 +282,14 @@ def extract_media_info(info):
             "owner": {
                 "username": info.get('uploader', ''),
                 "uploader_id": info.get('uploader_id', ''),
-                "uploader_url": info.get('uploader_url', '')
+                "uploader_url": info.get('uploader_url', ''),
+                "profile_picture": info.get('uploader_thumbnail', info.get('channel_thumbnail', ''))
             }
         }
         
         # Log the data type
         logger.info(f"Media type: {'Video' if post_data['is_video'] else 'Image'}")
+        logger.info(f"Profile picture URL: {post_data['owner']['profile_picture']}")
         
         # Extract hashtags from description
         if post_data["description"]:
@@ -348,7 +350,9 @@ def extract_media_info(info):
             "error": str(e),
             "urls": {},
             "is_video": False,
-            "owner": {}
+            "owner": {
+                "profile_picture": ""
+            }
         }
 
 def stream_media(url, content_type):
